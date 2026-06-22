@@ -1,0 +1,202 @@
+/****************************************************
+ * UNO R4 WiFi - NEST Security System
+ * 3 Presses = HOME (Anytime)
+ * 2 Presses = Start LEAVING (Only from HOME)
+ * 1 Press in AWAY = Wrong Password (after 5s window)
+ ****************************************************/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFiS3.h>
+#include <ThingSpeak.h>
+#include <DHT11.h>
+#include <LiquidCrystal_I2C.h>
+#include <BH1750.h>
+
+// --- WiFi / ThingSpeak ---
+const char* WIFI_SSID = "Free-TAU";
+const char* WIFI_PASS = "free-tau";
+unsigned long TS_CHANNEL_ID = 3225310UL;
+const char* TS_WRITE_API_KEY = "U36B69H90R9FDEWT";
+WiFiClient client;
+
+// --- Sensors & LCD ---
+DHT11 dht11(8);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+BH1750 lightMeter;
+
+// --- Pins ---
+const int NOISE_PIN = A0, SMOKE_PIN = 3, LED_PIN = 13;
+const int BUTTON_PIN = 4, PIR_PIN = 5;
+
+// --- State Variables ---
+enum Mode { MODE_HOME, MODE_LEAVING, MODE_AWAY };
+Mode mode = MODE_HOME;
+
+const unsigned long BTN_WINDOW_MS = 5000;
+const unsigned long LEAVING_DELAY_MS = 5000;
+const unsigned long WRONG_PW_AFTER_ARM_MS = 10000;
+
+unsigned long stateStartTime = 0, armedTime = 0;
+int pressCount = 0;
+unsigned long firstPressTime = 0;
+unsigned long lastBtnEdgeTime = 0;
+
+bool tempAlertActive = false, smokeAlertActive = false, fireAlertActive = false;
+bool motionAlertActive = false, wrongPasswordAlertActive = false;
+
+float tempC = NAN, lux = NAN;
+int noiseRaw = 0, noiseLevelPct = 0, smokeRaw = 0;
+unsigned long lastNormalLcdRefresh = 0, lastThingSpeak = 0, lastSerialSensPrint = 0;
+
+// LCD cache to prevent flickering
+String lastLine1 = "";
+String lastLine2 = "";
+
+// --- Helper Functions ---
+
+String modeToStr(Mode m) {
+  if (m == MODE_HOME) return "HOME";
+  if (m == MODE_LEAVING) return "LEAVING";
+  return "AWAY";
+}
+
+// THE MISSING FUNCTION:
+void lcdShow2LinesNoFlicker(const String& l1, const String& l2) {
+  String a = l1.substring(0, 20);
+  String b = l2.substring(0, 20);
+  if (a == lastLine1 && b == lastLine2) return;
+  lastLine1 = a; lastLine2 = b;
+  lcd.setCursor(0, 0); lcd.print("                    ");
+  lcd.setCursor(0, 1); lcd.print("                    ");
+  lcd.setCursor(0, 0); lcd.print(a);
+  lcd.setCursor(0, 1); lcd.print(b);
+}
+
+void setMode(Mode newMode) {
+  mode = newMode;
+  stateStartTime = millis();
+  Serial.print("\n>>> MODE CHANGE: "); Serial.println(modeToStr(mode));
+}
+
+// --- Logic Functions ---
+
+void handleButtonLogic() {
+  unsigned long now = millis();
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (now - lastBtnEdgeTime > 200) { 
+      if (pressCount == 0 || (now - firstPressTime > BTN_WINDOW_MS)) {
+        pressCount = 1;
+        firstPressTime = now;
+      } else {
+        pressCount++;
+      }
+      lastBtnEdgeTime = now;
+      Serial.print("[BTN] Press Count: "); Serial.println(pressCount);
+    }
+  }
+
+  if (pressCount > 0 && (now - firstPressTime > BTN_WINDOW_MS)) {
+    if (mode == MODE_AWAY && pressCount < 3) {
+      Serial.println("[SEC] Password Failed. ALERT!");
+      wrongPasswordAlertActive = true;
+    }
+    pressCount = 0; 
+  }
+
+  if (pressCount >= 3) {
+    setMode(MODE_HOME);
+    wrongPasswordAlertActive = false;
+    motionAlertActive = false;
+    pressCount = 0;
+  } else if (pressCount == 2 && mode == MODE_HOME) {
+    setMode(MODE_LEAVING);
+    pressCount = 0;
+  }
+}
+
+void updateDisplaySmart() {
+  lcd.setCursor(0, 0);
+  if (wrongPasswordAlertActive) lcd.print("ALERT: WRONG PASS   ");
+  else if (pressCount > 0)      lcd.print("Checking Pass: " + String(pressCount) + "   ");
+  else if (mode == MODE_LEAVING) lcd.print("LEAVING: Arming...  ");
+  else                          lcd.print("M:" + modeToStr(mode) + " Lx:" + String((int)lux) + "      ");
+
+  lcd.setCursor(0, 1);
+  String l2 = "T:";
+  l2 += isfinite(tempC) ? String(tempC, 1) + "C" : "ERR";
+  l2 += " Noise:" + String(noiseLevelPct) + "%";
+  while(l2.length() < 20) l2 += " ";
+  lcd.print(l2);
+
+  lcd.setCursor(0, 2);
+  int n = map(constrain(noiseLevelPct, 0, 100), 0, 100, 0, 20);
+  for (int i = 0; i < 20; i++) lcd.print((i < n) ? "#" : "-");
+
+  lcd.setCursor(0, 3);
+  lcd.print("NEST: Chen & Liza   ");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(SMOKE_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+
+  // YOUR UPDATED WELCOME SEQUENCE:
+  lcdShow2LinesNoFlicker("Welcome to NEST", "by Chen & Liza");
+  delay(3000);
+  Serial.println("[LCD] init done");
+
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  ThingSpeak.begin(client);
+  setMode(MODE_HOME);
+}
+
+void loop() {
+  unsigned long now = millis();
+  handleButtonLogic();
+
+  if (mode == MODE_LEAVING && (now - stateStartTime >= LEAVING_DELAY_MS)) {
+    setMode(MODE_AWAY);
+    armedTime = now;
+  }
+
+  // --- SENSORS ---
+  int t = 0, h = 0;
+  if (dht11.readTemperatureHumidity(t, h) == 0) tempC = t;
+  lux = lightMeter.readLightLevel();
+  noiseRaw = analogRead(A0);
+  noiseLevelPct = map(constrain(noiseRaw - 150, 0, 873), 0, 873, 0, 100);
+  smokeRaw = digitalRead(SMOKE_PIN);
+
+  // --- SERIAL DEBUG ---
+  // --- DEBUG SERIAL PRINT ---
+  if (now - lastSerialSensPrint >= 2000) {
+    lastSerialSensPrint = now;
+    Serial.print("[SENS] NoiseRaw: "); Serial.print(noiseRaw);
+    Serial.print(" | Noise%: "); Serial.print(noiseLevelPct);
+    Serial.print(" | Temp: "); Serial.print(tempC);
+    Serial.print(" | Lux: "); Serial.print(lux);
+    Serial.print(" | Smoke: "); Serial.print(smokeRaw == LOW ? "DETECTED" : "CLEAR");
+    Serial.print(" | Mode: "); Serial.println(modeToStr(mode));
+  }
+
+  digitalWrite(LED_PIN, (wrongPasswordAlertActive || motionAlertActive) ? HIGH : LOW);
+  updateDisplaySmart();
+
+  if (now - lastThingSpeak >= 20000) {
+    if(WiFi.status() == WL_CONNECTED){
+      ThingSpeak.setField(1, noiseRaw);
+      ThingSpeak.setField(4, tempC);
+      ThingSpeak.writeFields(TS_CHANNEL_ID, TS_WRITE_API_KEY);
+    }
+    lastThingSpeak = now;
+  }
+}
